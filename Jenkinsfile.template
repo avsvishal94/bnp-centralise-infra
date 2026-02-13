@@ -6,363 +6,211 @@
 // Infrastructure Provisioning - Jenkins CI/CD integration with Terraform IaC
 //
 // Pipeline Stages:
-//   1. Checkout Code
-//   2. Terraform Initialization and Validation
-//   3. Approval and Change Management
-//   4. Terraform Apply - Infrastructure Deployment
-//   5. Terraform Destroy (Conditional)
-//   6. Post-Deployment Validation
+//   1. Clone Repo
+//   2. Terraform Init
+//   3. Terraform Validate
+//   4. Terraform Plan
+//   5. Terraform Apply (Conditional)
+//   6. Terraform Destroy (Conditional)
 // ============================================================================
 
 // ---- CyberArk Credentials (SRE Managed) ----
-def cyberarkCertFile = '{{CYBERARK_CERT_ID}}'       // Jenkins credentials store ID with CyberArk Certificate file
-def cyberarkKeyFile  = '{{CYBERARK_KEY_ID}}'         // Jenkins credentials store ID with CyberArk Key file
-def cyberarkCAFile   = 'CA_Bundle.pem'               // Jenkins credentials store ID with CyberArk CA_Bundle file
+def cyberarkCertFile = 'AIM-PBGBLPRIMEDB-OPSD-Cyberark.cert'
+def cyberarkKeyFile  = 'AIM-PBGBLPRIMEDB-OPSD-Cyberark.key'
+def cyberarkCAFile   = 'CA_Bundle.pem'
 
 pipeline {
+
     agent {
-        label 'terraform-agent'   // Agent any (terraform installed agents)
-    }
-
-    parameters {
-        choice(
-            name: 'ENVIRONMENT',
-            choices: [{{ENVIRONMENT_CHOICES}}],
-            description: 'Select environment on which the script needs to be run'
-        )
-        choice(
-            name: 'ECOSYSTEM',
-            choices: [{{ECOSYSTEM_CHOICES}}],
-            description: 'Select ecosystem on which the script needs to be run'
-        )
-        choice(
-            name: 'ACTION',
-            choices: ['apply', 'destroy'],
-            description: 'Select Terraform action: apply to deploy, destroy to tear down'
-        )
-        booleanParam(
-            name: 'AUTO_APPROVE',
-            defaultValue: false,
-            description: 'Skip manual approval gate? (Use with caution)'
-        )
-        string(
-            name: 'TARGET_BRANCH',
-            defaultValue: 'main',
-            description: 'Branch to checkout (main, develop, feature/*)'
-        )
-    }
-
-    environment {
-        TF_VAR_env       = "${params.ENVIRONMENT}"
-        TF_VAR_ecosystem = "${params.ECOSYSTEM}"
-        TF_IN_AUTOMATION = 'true'
-        TF_PLAN_FILE     = "tfplan-${params.ENVIRONMENT}-${BUILD_NUMBER}.out"
-        ARTIFACTORY_URL  = '{{ARTIFACTORY_URL}}'
+        label 'bnpp-cdtools-amer'
     }
 
     options {
         buildDiscarder(logRotator(numToKeepStr: '20'))
+        disableConcurrentBuilds()
         timestamps()
         timeout(time: 60, unit: 'MINUTES')
-        disableConcurrentBuilds()
     }
 
-    // ========================================================================
-    // STAGE 1: Checkout Code
-    // ========================================================================
-    stages {
-        stage('Stage 1: Checkout Code') {
-            steps {
-                echo "=== Stage 1: Checkout Code ==="
-                echo "Branch: ${params.TARGET_BRANCH}"
+    parameters {
 
-                // Git checkout from main/develop/feature
+        choice(name: 'ENVIRONMENT',
+               choices: ['DEV', 'STG'],
+               description: 'Select environment')
+
+        booleanParam(name: 'destroy',
+                     defaultValue: false,
+                     description: 'Destroy Terraform build?')
+
+        choice(name: 'ECOSYSTEM',
+               choices: ['PB-GLOBALPRIMEDB', 'Puma'],
+               description: 'Select ecosystem')
+
+        string(name: 'APPLICATION_NAME',
+               defaultValue: 'abc',
+               description: 'Application name')
+    }
+
+    environment {
+        TF_IN_AUTOMATION = "true"
+        TF_INPUT         = "false"
+        TF_LOCK_TIMEOUT  = "300s"
+        TF_VAR_env       = "${params.ENVIRONMENT}"
+        TF_VAR_ecosystem = "${params.ECOSYSTEM}"
+    }
+
+    stages {
+
+        // ====================================================================
+        // STAGE 1: Clone Repo
+        // ====================================================================
+        stage('Clone Repo') {
+            steps {
+                echo "=== Stage 1: Clone Repo ==="
                 checkout scm
                 sh 'printenv'
-
-                // Pull Terraform code
-                echo "Terraform code pulled from repository"
-
-                // Fetch modules from Artifactory
-                withCredentials([
-                    usernamePassword(
-                        credentialsId: '{{ARTIFACTORY_CRED_ID}}',
-                        usernameVariable: 'USERNAME',
-                        passwordVariable: 'TF_TOKEN_artifactory_cib_echonet'
-                    )
-                ]) {
-                    sh '''
-                        echo "Fetching Terraform modules from Artifactory..."
-                        echo "Repository: infra-repo"
-                        echo "Branch: ${TARGET_BRANCH}"
-                    '''
-                }
             }
         }
 
         // ====================================================================
-        // STAGE 2: Terraform Initialization and Validation
+        // STAGE 2: Terraform Init
         // ====================================================================
-        stage('Stage 2: Terraform Initialization and Validation') {
+        stage('Terraform Init') {
             steps {
-                echo "=== Stage 2: Terraform Initialization and Validation ==="
+                echo "=== Stage 2: Terraform Init ==="
 
                 withCredentials([
                     usernamePassword(
-                        credentialsId: '{{ARTIFACTORY_CRED_ID}}',
-                        usernameVariable: 'USERNAME',
-                        passwordVariable: 'TF_TOKEN_artifactory_cib_echonet'
-                    )
-                ]) {
-                    // --- terraform init ---
-                    // Backend config (Artifactory), Provider download, Module init from Artifactory
-                    sh '''
-                        echo ">>> terraform init"
-                        echo "  - Backend config: Artifactory"
-                        echo "  - Provider download: hashicorp/vsphere"
-                        echo "  - Module init from Artifactory"
-                        terraform init \
-                            -backend=true \
-                            -input=false
-                    '''
-
-                    // --- terraform validate ---
-                    // Syntax check, Config validation, Format check
-                    sh '''
-                        echo ">>> terraform validate"
-                        echo "  - Syntax check"
-                        echo "  - Config validation"
-                        echo "  - Format check"
-                        terraform validate
-                        terraform fmt -check -recursive
-                    '''
-
-                    // --- terraform plan ---
-                    // Generate plan file, Resource diff, Archive artifact
-                    sh """
-                        echo ">>> terraform plan"
-                        echo "  - Generate plan file"
-                        echo "  - Resource diff"
-                        terraform plan \
-                            -input=false \
-                            -out=${TF_PLAN_FILE} \
-                            -detailed-exitcode || PLAN_EXIT=\$?
-
-                        echo "Plan exit code: \${PLAN_EXIT:-0}"
-                    """
-
-                    // Archive the plan file as build artifact
-                    archiveArtifacts artifacts: "${TF_PLAN_FILE}", fingerprint: true
-                }
-            }
-        }
-
-        // ====================================================================
-        // STAGE 3: Approval and Change Management
-        // ====================================================================
-        stage('Stage 3: Approval and Change Management') {
-            when {
-                expression { return params.ACTION == 'apply' && !params.AUTO_APPROVE }
-            }
-            steps {
-                echo "=== Stage 3: Approval and Change Management ==="
-
-                script {
-                    // --- ServiceNow API Integration ---
-                    // Create CHG ticket, Validate approval, Attach plan file
-                    echo "ServiceNow Integration:"
-                    echo "  - Creating CHG ticket for ${params.ENVIRONMENT} deployment..."
-                    echo "  - Attaching plan file: ${TF_PLAN_FILE}"
-
-                    // Placeholder for ServiceNow API call
-                    // def chgTicket = serviceNowCreateChange(
-                    //     description: "Terraform deployment to ${params.ENVIRONMENT}",
-                    //     environment: params.ENVIRONMENT,
-                    //     planFile: TF_PLAN_FILE
-                    // )
-
-                    // --- Notifications ---
-                    // Email alerts, Teams message
-                    echo "Sending notifications..."
-                    echo "  - Email alerts to approvers"
-                    echo "  - Teams message to channel"
-
-                    // --- Manual Approval ---
-                    // Input message: Approve deployment to env?
-                    def userInput = input(
-                        id: 'approval',
-                        message: "Approve deployment to ${params.ENVIRONMENT}?",
-                        submitter: '{{APPROVER_GROUP}}',
-                        parameters: [
-                            string(
-                                name: 'APPROVAL_NOTES',
-                                defaultValue: '',
-                                description: 'Add any notes for this deployment'
-                            )
-                        ]
-                    )
-
-                    echo "Deployment approved. Notes: ${userInput}"
-                }
-            }
-        }
-
-        // ====================================================================
-        // STAGE 4: Terraform Apply - Infrastructure Deployment
-        // ====================================================================
-        stage('Stage 4: Terraform Apply - Infrastructure Deployment') {
-            when {
-                expression { return params.ACTION == 'apply' }
-            }
-            steps {
-                echo "=== Stage 4: Terraform Apply - Infrastructure Deployment ==="
-
-                withCredentials([
-                    usernamePassword(
-                        credentialsId: '{{ARTIFACTORY_CRED_ID}}',
+                        credentialsId: 'primedb_cib_artifactory',
                         usernameVariable: 'USERNAME',
                         passwordVariable: 'TF_TOKEN_artifactory_cib_echonet'
                     ),
-                    string(
-                        credentialsId: '{{APIGEE_CRED_ID}}',
-                        variable: 'IV2_API_KEY'
-                    )
+                    file(credentialsId: cyberarkCertFile, variable: 'CYBERARK_CERT'),
+                    file(credentialsId: cyberarkKeyFile,  variable: 'CYBERARK_KEY'),
+                    file(credentialsId: cyberarkCAFile,   variable: 'CYBERARK_CA')
                 ]) {
-                    script {
-                        // terraform apply
-                        //   - Load plan file
-                        //   - Execute deployment
-                        //   - Capture outputs
-                        //   - Update state in Artifactory
-                        sh """
-                            echo ">>> terraform apply"
-                            echo "  - Loading plan file: ${TF_PLAN_FILE}"
-                            echo "  - Executing deployment to ${params.ENVIRONMENT}"
-                            export TF_LOG=TRACE
 
-                            terraform apply \
-                                -input=false \
-                                -auto-approve \
-                                ${TF_PLAN_FILE}
-
-                            echo ">>> Capturing outputs..."
-                            terraform output -json > tf-outputs-${params.ENVIRONMENT}.json
-
-                            echo "  - State updated in Artifactory"
-                            echo "  - Outputs captured"
-                        """
-
-                        archiveArtifacts artifacts: "tf-outputs-${params.ENVIRONMENT}.json", fingerprint: true
-                    }
+                    sh """
+                        terraform -chdir=Environments/${params.ENVIRONMENT} init -reconfigure \
+                          -backend-config="repo=terraform-state" \
+                          -backend-config="subpath=${params.ECOSYSTEM}/${params.APPLICATION_NAME}/${params.ENVIRONMENT}/terraform.tfstate"
+                    """
                 }
             }
         }
 
         // ====================================================================
-        // STAGE 5: Terraform Destroy (Conditional)
+        // STAGE 3: Terraform Validate
         // ====================================================================
-        stage('Stage 5: Terraform Destroy') {
+        stage('Terraform Validate') {
+            steps {
+                echo "=== Stage 3: Terraform Validate ==="
+
+                sh """
+                    terraform -chdir=Environments/${params.ENVIRONMENT} validate
+                    terraform -chdir=Environments/${params.ENVIRONMENT} fmt -check -recursive
+                """
+            }
+        }
+
+        // ====================================================================
+        // STAGE 4: Terraform Plan
+        // ====================================================================
+        stage('Terraform Plan') {
             when {
-                expression { return params.ACTION == 'destroy' }
+                expression { return !params.destroy }
             }
             steps {
-                echo "=== Stage 5: Terraform Destroy ==="
-
-                script {
-                    input(
-                        message: "CONFIRM: Destroy ALL infrastructure in ${params.ENVIRONMENT}?",
-                        ok: 'Yes, destroy it'
-                    )
-                }
+                echo "=== Stage 4: Terraform Plan ==="
 
                 withCredentials([
                     usernamePassword(
-                        credentialsId: '{{ARTIFACTORY_CRED_ID}}',
+                        credentialsId: 'primedb_cib_artifactory',
                         usernameVariable: 'USERNAME',
                         passwordVariable: 'TF_TOKEN_artifactory_cib_echonet'
                     ),
+                    file(credentialsId: cyberarkCertFile, variable: 'CYBERARK_CERT'),
+                    file(credentialsId: cyberarkKeyFile,  variable: 'CYBERARK_KEY'),
+                    file(credentialsId: cyberarkCAFile,   variable: 'CYBERARK_CA'),
                     string(
-                        credentialsId: '{{APIGEE_CRED_ID}}',
+                        credentialsId: 'APIGEE_PDB_DEV',
                         variable: 'IV2_API_KEY'
                     )
                 ]) {
-                    // terraform destroy
-                    //   - Load plan file and state file
-                    //   - Execute destruction
-                    //   - Capture outputs
-                    //   - Update state in Artifactory
-                    sh '''
-                        echo ">>> terraform destroy"
-                        echo "  - Loading state file from Artifactory"
-                        echo "  - Executing destruction"
-                        export TF_LOG=TRACE
 
-                        terraform destroy \
-                            -input=false \
-                            -auto-approve
-
-                        echo "  - Destruction complete"
-                        echo "  - State updated in Artifactory"
-                    '''
+                    sh """
+                        terraform -chdir=Environments/${params.ENVIRONMENT} plan -out=tfplan
+                        terraform -chdir=Environments/${params.ENVIRONMENT} show tfplan
+                    """
                 }
             }
         }
 
         // ====================================================================
-        // STAGE 6: Post-Deployment Validation
+        // STAGE 5: Terraform Apply
         // ====================================================================
-        stage('Stage 6: Post-Deployment Validation') {
+        stage('Terraform Apply') {
             when {
-                expression { return params.ACTION == 'apply' }
+                expression { return !params.destroy }
             }
             steps {
-                echo "=== Stage 6: Post-Deployment Validation ==="
+                echo "=== Stage 5: Terraform Apply ==="
 
-                script {
-                    // --- Smoke Tests ---
-                    echo "Running Smoke Tests..."
-                    sh '''
-                        echo "  - Verifying infrastructure endpoints..."
-                        echo "  - Checking connectivity to provisioned resources..."
-                        # Add custom smoke test commands here
-                        # Example: curl -sf https://<app-url>/health || exit 1
-                    '''
+                input message: "Approve Terraform Apply?"
 
-                    // --- Health Checks ---
-                    echo "Running Health Checks..."
-                    sh '''
-                        echo "  - Checking Load Balancer (HAProxy) health..."
-                        echo "  - Checking Reverse Proxy (Apache HTTPD 2.4) status..."
-                        echo "  - Checking App Servers (Java/Dataframe) availability..."
-                        echo "  - Checking NFS mount points (/mnt/data, /mnt/binaries)..."
-                        # Add health check commands
-                    '''
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'primedb_cib_artifactory',
+                        usernameVariable: 'USERNAME',
+                        passwordVariable: 'TF_TOKEN_artifactory_cib_echonet'
+                    ),
+                    file(credentialsId: cyberarkCertFile, variable: 'CYBERARK_CERT'),
+                    file(credentialsId: cyberarkKeyFile,  variable: 'CYBERARK_KEY'),
+                    file(credentialsId: cyberarkCAFile,   variable: 'CYBERARK_CA'),
+                    string(
+                        credentialsId: 'APIGEE_PDB_DEV',
+                        variable: 'IV2_API_KEY'
+                    )
+                ]) {
 
-                    // --- Ansible Config ---
-                    echo "Running Ansible post-deployment configuration..."
-                    sh '''
-                        echo "  - Executing Ansible playbooks for post-deploy config..."
-                        # Example: ansible-playbook -i inventory post-deploy.yml
-                    '''
-
-                    // --- Generate Report ---
-                    echo "Generating deployment report..."
                     sh """
-                        echo "========================================" > deployment-report-${params.ENVIRONMENT}.txt
-                        echo " Deployment Report"                      >> deployment-report-${params.ENVIRONMENT}.txt
-                        echo "========================================" >> deployment-report-${params.ENVIRONMENT}.txt
-                        echo " Environment: ${params.ENVIRONMENT}"     >> deployment-report-${params.ENVIRONMENT}.txt
-                        echo " Ecosystem:   ${params.ECOSYSTEM}"       >> deployment-report-${params.ENVIRONMENT}.txt
-                        echo " Build:       ${BUILD_NUMBER}"           >> deployment-report-${params.ENVIRONMENT}.txt
-                        echo " Branch:      ${params.TARGET_BRANCH}"   >> deployment-report-${params.ENVIRONMENT}.txt
-                        echo " Action:      ${params.ACTION}"          >> deployment-report-${params.ENVIRONMENT}.txt
-                        echo " Timestamp:   \$(date -u)"               >> deployment-report-${params.ENVIRONMENT}.txt
-                        echo "========================================" >> deployment-report-${params.ENVIRONMENT}.txt
-                        terraform output -json                         >> deployment-report-${params.ENVIRONMENT}.txt 2>/dev/null || true
-                        echo "========================================" >> deployment-report-${params.ENVIRONMENT}.txt
+                        terraform -chdir=Environments/${params.ENVIRONMENT} apply -auto-approve tfplan
+                        terraform -chdir=Environments/${params.ENVIRONMENT} output -json
                     """
+                }
+            }
+        }
 
-                    archiveArtifacts artifacts: "deployment-report-${params.ENVIRONMENT}.txt", fingerprint: true
+        // ====================================================================
+        // STAGE 6: Terraform Destroy
+        // ====================================================================
+        stage('Terraform Destroy') {
+            when {
+                equals expected: true, actual: params.destroy
+            }
+            steps {
+                echo "=== Stage 6: Terraform Destroy ==="
+
+                input message: "Confirm Terraform Destroy?"
+
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'primedb_cib_artifactory',
+                        usernameVariable: 'USERNAME',
+                        passwordVariable: 'TF_TOKEN_artifactory_cib_echonet'
+                    ),
+                    file(credentialsId: cyberarkCertFile, variable: 'CYBERARK_CERT'),
+                    file(credentialsId: cyberarkKeyFile,  variable: 'CYBERARK_KEY'),
+                    file(credentialsId: cyberarkCAFile,   variable: 'CYBERARK_CA'),
+                    string(
+                        credentialsId: 'APIGEE_PDB_DEV',
+                        variable: 'IV2_API_KEY'
+                    )
+                ]) {
+
+                    sh """
+                        terraform -chdir=Environments/${params.ENVIRONMENT} destroy -auto-approve
+                    """
                 }
             }
         }
@@ -373,10 +221,10 @@ pipeline {
     // ========================================================================
     post {
         success {
-            echo "Pipeline completed successfully for ${params.ENVIRONMENT} - ${params.ACTION}"
+            echo "Pipeline completed successfully for ${params.ENVIRONMENT} - ${params.ECOSYSTEM}/${params.APPLICATION_NAME}"
         }
         failure {
-            echo "Pipeline FAILED for ${params.ENVIRONMENT} - ${params.ACTION}"
+            echo "Pipeline FAILED for ${params.ENVIRONMENT} - ${params.ECOSYSTEM}/${params.APPLICATION_NAME}"
         }
         always {
             cleanWs()
