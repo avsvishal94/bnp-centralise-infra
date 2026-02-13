@@ -1,0 +1,35 @@
+# ============================================================================
+# Example Terraform Variables File
+# ============================================================================
+# Copy this file to terraform.tfvars and fill in values for your environment.
+# Note: env and ecosystem are injected by the Jenkins pipeline via TF_VAR_*.
+# ============================================================================
+
+# ---- Application Identity ----
+app_name = "dataframe-webservice"
+
+# ---- vSphere Connection ----
+vsphere_server   = "vcenter.cib.echonet"
+vsphere_user     = "svc-terraform@vsphere.local"
+vsphere_password = ""  # Use Jenkins credentials / CyberArk
+
+# ---- NSX-T Connection ----
+nsxt_host     = "nsxt-mgr.cib.echonet"
+nsxt_username = "admin"
+nsxt_password = ""  # Use Jenkins credentials / CyberArk
+
+# ---- vSphere Infrastructure ----
+datacenter    = "DC-AMER-01"
+datastore     = "datastore-ssd-01"
+cluster       = "cluster-compute-01"
+network       = "vlan-app-100"
+template_name = "rhel8-template"
+folder        = "terraform-managed"
+
+# ---- Resource Sizing ----
+lb_memory_mb     = 2048
+rp_memory_mb     = 2048
+app_memory_mb    = 4096
+app_disk_gb      = 50
+nfs_data_disk_gb = 200
+nfs_bin_disk_gb  = 100

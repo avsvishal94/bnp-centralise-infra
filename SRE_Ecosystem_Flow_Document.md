@@ -1,4 +1,4 @@
-# SRE Ecosystem – Infrastructure Provisioning with Jenkins CI/CD and Terraform IaC
+# SRE Ecosystem – Centrally Managed Terraform Infrastructure Pipeline
 
 ## Flow Document
 
@@ -6,65 +6,128 @@
 
 ## 1. Overview
 
-This document describes the end-to-end flow for infrastructure provisioning using a Jenkins CI/CD pipeline integrated with Terraform Infrastructure as Code (IaC). The architecture is split into two major halves: the CI/CD orchestration (left side) and the target infrastructure in a DC/DR setup (right side). Jenkins agents with Terraform installed act as the bridge, executing Terraform commands that provision and manage the infrastructure components.
+This document describes the end-to-end architecture for the SRE Ecosystem — a centrally managed Terraform infrastructure pipeline. The architecture is organized into three layers: the **SRE Managed Layer** (centrally owned), the **Application Team Layer** (consumer), and the **Infrastructure Layer** (resources provisioned). Jenkins CI/CD orchestrates Terraform IaC execution through dedicated agents, with all credentials managed via CyberArk and state files stored in Artifactory.
 
 ---
 
-## 2. Architecture Components
+## 2. Architecture Layers
 
-### 2.1 Version Control (Bitbucket)
+### 2.1 SRE Managed Layer (Centrally Owned)
 
-All infrastructure code lives in a Bitbucket repository called `infra-repo`. The team works across three branch types: `main` (production-ready), `develop` (integration), and `feature/*` (development). A webhook trigger fires on every Push or Pull Request, automatically invoking the Jenkins pipeline.
+This layer contains all components owned and maintained by the SRE team. Application teams consume these components but do not modify them.
 
-### 2.2 Jenkins CI/CD Orchestration
+#### Terraform Module Registry (Artifactory)
 
-The Jenkins controller orchestrates the entire pipeline. It runs on agents that have Terraform pre-installed and uses several key plugins: the Terraform Plugin for executing `terraform` commands, Git Plugin for SCM checkout, Pipeline Plugin for declarative/scripted pipelines, and Credentials Plugin for secure secret management. The pipeline accepts choice parameters — `apply` or `destroy` — to determine the execution path.
+The module registry is hosted in Artifactory and contains:
+- **Versioned TF Modules** — Reusable modules for vSphere VMs, HAProxy load balancers, NSX-T firewalls, and NFS servers (`terraform-modules/modules/`)
+- **Marketplace Inventory** — VM templates available for provisioning
+- **Service Catalog** — Approved infrastructure patterns and configurations
 
-### 2.3 Jenkins Pipeline Stages (Jenkinsfile)
+Modules are stored in `terraform-modules/modules/` with the following structure:
+- `vsphere-vm/` — Base VM provisioning module
+- `haproxy-lb/` — HAProxy load balancer (wraps vsphere-vm)
+- `nsx-firewall/` — NSX-T firewall security policies
+- `nfs-server/` — NFS storage server (wraps vsphere-vm)
 
-The pipeline is defined in a Jenkinsfile with six stages:
+#### Jenkins Shared Library (jenkins-devops-cicd-library)
 
-**Stage 1 — Checkout Code.** The pipeline checks out the target branch from Bitbucket, pulls the Terraform code, and fetches any required modules from the Artifactory module registry.
+The shared library (`jenkins-shared-library/`) provides reusable pipeline steps:
+- **Pipeline Templates** — Jenkinsfile.template with 6-stage pipeline
+- **Reusable Steps** — `terraformInit`, `terraformValidate`, `terraformPlan`, `terraformApply`, `terraformDestroy`, `postDeployValidation`, `approvalGate`, `artifactoryModuleFetch`
+- **CyberArk Integration** — `cyberarkCredentials` helper for certificate injection
+- **Credential Helpers** — Wrappers for Artifactory and Apigee credential loading
 
-**Stage 2 — Terraform Initialization and Validation.** This stage runs three sub-steps. First, `terraform init` configures the Artifactory remote backend, downloads the hashicorp/vsphere provider, and initializes modules from Artifactory. Next, `terraform validate` performs syntax checking, configuration validation, and format checking. Finally, `terraform plan` generates a plan file showing the resource diff and archives it as a build artifact for audit.
+#### Terraform State Management (Artifactory Remote Backend)
 
-**Stage 3 — Approval and Change Management.** Before any infrastructure changes are applied, the pipeline pauses for a manual approval gate. An input message asks the operator to approve deployment to the selected environment. In parallel, the pipeline integrates with ServiceNow API to create a CHG (Change) ticket, validate the approval, and attach the plan file. Notifications are sent via email alerts and Microsoft Teams messages to keep stakeholders informed.
+State files are stored in Artifactory with per-application, per-environment isolation:
+```
+terraform-statefiles/
+└── <app-name>/
+    ├── dev/
+    ├── stg/
+    ├── pt/
+    └── qa/
+```
+State locking prevents concurrent modifications.
 
-**Stage 4 — Terraform Apply (Infrastructure Deployment).** This stage loads the archived plan file and executes the deployment with `terraform apply`. Outputs are captured in JSON format and the state file is updated in Artifactory. This is the stage where the Jenkins agent reaches across to the infrastructure DC/DR and provisions all the components.
+#### Jenkinsfile Template Generator
 
-**Stage 5 — Terraform Destroy (Conditional).** This stage only executes when the operator selects `destroy` as the action parameter. It loads the plan file and state file, executes `terraform destroy -auto-approve`, captures outputs, and updates the state in Artifactory. An additional confirmation prompt provides a safety gate.
+The `Jenkinsfile.template` generates per-application Jenkinsfiles with:
+- Environment parameters (DEV, STG, PT, QA)
+- Ecosystem parameters (PB-GLOBALPRIMEDB, Puma)
+- CyberArk certificate configuration
+- Artifactory credential IDs
 
-**Stage 6 — Post-Deployment Validation.** After a successful apply, the pipeline runs four validation steps: smoke tests to verify endpoint connectivity, health checks against the load balancer, reverse proxies, and app servers, Ansible configuration for any post-deploy setup, and a deployment report generator that archives the full summary.
+#### Credential Store (Jenkins + CyberArk)
 
-### 2.4 Infrastructure — DC/DR (Target Environment)
+All sensitive credentials are managed centrally:
+- **CyberArk Certs** — TLS certificates for API authentication
+- **CA Bundle** — Certificate authority chain
+- **Artifactory Tokens** — Service account credentials for state and module access
+- **API Keys** — Apigee and other service API keys
 
-The right side of the architecture represents the infrastructure that Terraform provisions. Traffic flows from the top down:
+#### SRE Onboarding Script
 
-**URL Entry Point** — The public or internal URL that routes traffic into the environment.
+The `sre_onboard_app.sh` script automates application onboarding:
+1. Creates statefile directories in Artifactory
+2. Generates Jenkinsfile from template with app-specific values
+3. Copies sample Terraform files for the application team
+4. Optionally pushes generated files to the application repository
 
-**NSX-T Firewall** — A network firewall allowing only ports 443 (HTTPS) and 80 (HTTP). This is the security perimeter.
+#### Terraform Agent (Provisioned from Marketplace)
 
-**Load Balancing / Proxy Layer** — An HAProxy load balancer (tagged `terraform-managed`) distributes traffic to two Apache HTTPD 2.4 reverse proxies. Each proxy runs on 1 CPU with configurable RAM. This layer provides SSL termination, request routing, and high availability.
-
-**Application Layer** — Four Java/Dataframe application servers running the `dataframe-webservice` process. Each server is allocated 1 CPU with configurable RAM and disk. The four-server setup ensures horizontal scalability and fault tolerance.
-
-**Storage Layer** — Two NFS servers provide shared storage. The NFS Data Server exports `/mnt/data` for application data, and the NFS Binary Server exports `/mnt/binaries` for application binaries. Both are encrypted at rest with daily backups.
-
-### 2.5 Jenkins Agents (Terraform Installed)
-
-Two dedicated Jenkins agents (`jenkins-agent-1` and `jenkins-agent-2`) execute the Terraform commands. Each agent has the `hashicorp/vsphere` Terraform provider configured (for VMware vSphere infrastructure) along with `terraform`, `ansible`, and `jq` installed. These agents are the execution bridge between the Jenkins pipeline and the target infrastructure.
+Dedicated Jenkins agents provisioned via `terraform-agent/setup-agent.sh`:
+- Terraform installation and configuration
+- Java installation (Jenkins agent requirement)
+- Ansible and jq installation
+- SSH-based Jenkins agent configuration
+- Agent labeled as `terraform-agent` for pipeline targeting
+- Artifactory provider mirror configured in `~/.terraformrc`
 
 ---
 
-## 3. End-to-End Flow
+### 2.2 Application Team Layer (Consumer)
 
-A developer pushes code to the `infra-repo` on Bitbucket. The webhook triggers Jenkins. The pipeline checks out the code, initializes Terraform with the Artifactory backend, validates the configuration, and generates a plan. The plan is archived and a ServiceNow change ticket is created. After manual approval and team notification, Terraform applies the plan through a Jenkins agent, provisioning the full stack: firewall rules, load balancer, reverse proxies, application servers, and NFS storage. Post-deployment validation confirms everything is healthy, and a report is generated.
+#### Application Repo (Bitbucket)
 
-For teardown, the operator triggers the pipeline with `destroy` selected. After confirmation, Terraform destroys all provisioned resources and updates the state.
+Each application repository contains:
+- **Jenkinsfile** — Auto-generated by SRE onboarding (references shared library)
+- **Terraform .tf files** — Infrastructure definitions authored by the app team
+  - `backend.tf` — Artifactory remote backend configuration
+  - `variables.tf` — Pipeline-injected and user-defined variables
+  - `main.tf` — Infrastructure resource definitions using SRE modules
+  - `outputs.tf` — Output values captured by the pipeline
+
+Sample Terraform files are provided in `sample-app-terraform/` for bootstrapping.
+
+#### Jenkins Pipeline (bnpp-cdtools-amer)
+
+The pipeline accepts build parameters:
+- **ENVIRONMENT** — DEV, STG, PT, QA
+- **ECOSYSTEM** — PB-GLOBALPRIMEDB, Puma
+- **ACTION** — apply or destroy
+- **AUTO_APPROVE** — Skip manual approval gate
+- **TARGET_BRANCH** — Branch to checkout
+
+#### Terraform Execution Stages
+
+The 6-stage pipeline executes:
+1. **Clone Repo** — Checkout code, fetch modules from Artifactory
+2. **TF Init** — Initialize backend, download providers, init modules
+3. **TF Plan** — Generate and archive execution plan
+4. **Approval** — Manual gate with ServiceNow integration
+5. **TF Apply** — Execute plan, capture outputs, update state
+6. **TF Destroy** — (Conditional) Destroy infrastructure with confirmation
 
 ---
 
-## 4. Infrastructure Resources Provisioned
+### 2.3 Infrastructure Layer (Resources Provisioned)
+
+#### Target Environments
+
+Infrastructure is provisioned across four isolated environments: **DEV**, **STG**, **PT**, **QA**.
+
+Each environment receives the full infrastructure stack:
 
 | Component | Quantity | Technology | Specs |
 |-----------|----------|------------|-------|
@@ -74,13 +137,103 @@ For teardown, the operator triggers the pipeline with `destroy` selected. After 
 | App Server | 4 | Java/Dataframe | 1 CPU, configurable RAM/Disk |
 | NFS Data Server | 1 | NFS | /mnt/data, encrypted, daily backup |
 | NFS Binary Server | 1 | NFS | /mnt/binaries, encrypted, daily backup |
-| Jenkins Agent | 2 | Terraform/Ansible/jq | hashicorp/vsphere provider |
+
+#### Remote State Files (Artifactory Backend)
+
+All Terraform state is persisted in Artifactory with:
+- Per-environment isolation
+- State locking for concurrent access prevention
+- Encrypted storage
 
 ---
 
-## 5. Security Model
+## 3. Security Model
 
-All credentials flow through Jenkins Credential Store backed by CyberArk. The NSX-T firewall restricts ingress to ports 443 and 80 only. NFS storage is encrypted at rest. The pipeline enforces manual approval gates and ServiceNow change management before any production changes. Terraform state files are stored securely in Artifactory with locking to prevent concurrent modifications.
+- All credentials flow through **Jenkins Credential Store backed by CyberArk**
+- **NSX-T firewall** restricts ingress to ports 443 and 80 only
+- **NFS storage** is encrypted at rest with daily backups
+- **Manual approval gates** and ServiceNow change management before production changes
+- **Terraform state files** stored securely in Artifactory with locking
+- **Provider pinning** ensures consistent Terraform provider versions
+
+---
+
+## 4. Best Practices
+
+### Terraform Agent Setup
+1. Create VM from Marketplace image
+2. Install Java (OpenJDK 17)
+3. Install Terraform (pinned version)
+4. Create jenkins user with SSH access
+5. Configure SSH-based Jenkins agent
+6. Label agent as `terraform-agent` for infra/terraform jobs
+
+### On-Premise Terraform
+- **Environment Isolation** — Separate state files per environment
+- **Module Versioning** — Versioned modules in Artifactory registry
+- **State Locking** — Artifactory backend with locking mechanism
+- **Credentials in Jenkins Store** — CyberArk-backed, never in code
+- **Provider Pinning** — Pin provider versions in required_providers
+- **DRY Principle** — Reusable modules, shared library steps
+- **Post-Deploy Ansible** — Configuration management after provisioning
+- **Documentation** — Architecture docs, step-by-step guides, troubleshooting
+
+---
+
+## 5. Repository Structure
+
+```
+bnp-centralise-infra/
+├── Jenkinsfile.template                    # Master pipeline template (6 stages)
+├── sre_onboard_app.sh                      # Application onboarding automation
+├── SRE_Ecosystem_Flow_Document.md          # Architecture documentation (this file)
+├── SRE_Step_by_Step_Instructions.md        # Setup and usage guide
+│
+├── jenkins-shared-library/                 # Jenkins Shared Library
+│   ├── vars/                               # Reusable pipeline steps
+│   │   ├── terraformInit.groovy            # terraform init wrapper
+│   │   ├── terraformValidate.groovy        # terraform validate wrapper
+│   │   ├── terraformPlan.groovy            # terraform plan wrapper
+│   │   ├── terraformApply.groovy           # terraform apply wrapper
+│   │   ├── terraformDestroy.groovy         # terraform destroy wrapper
+│   │   ├── cyberarkCredentials.groovy      # CyberArk credential helper
+│   │   ├── approvalGate.groovy             # Approval + ServiceNow integration
+│   │   ├── postDeployValidation.groovy     # Smoke tests, health checks, reports
+│   │   └── artifactoryModuleFetch.groovy   # Artifactory module fetcher
+│   ├── src/org/sre/ecosystem/              # Helper classes
+│   │   └── TerraformHelper.groovy          # Terraform utility methods
+│   └── resources/                          # Configuration resources
+│       └── terraform-provider-mirror.tfrc  # Artifactory provider mirror config
+│
+├── terraform-modules/                      # Terraform Module Registry
+│   └── modules/
+│       ├── vsphere-vm/                     # Base VM module
+│       │   ├── main.tf
+│       │   ├── variables.tf
+│       │   └── outputs.tf
+│       ├── haproxy-lb/                     # HAProxy load balancer module
+│       │   ├── main.tf
+│       │   ├── variables.tf
+│       │   └── outputs.tf
+│       ├── nsx-firewall/                   # NSX-T firewall module
+│       │   ├── main.tf
+│       │   ├── variables.tf
+│       │   └── outputs.tf
+│       └── nfs-server/                     # NFS storage module
+│           ├── main.tf
+│           ├── variables.tf
+│           └── outputs.tf
+│
+├── terraform-agent/                        # Terraform Agent Provisioning
+│   └── setup-agent.sh                      # Agent setup script
+│
+└── sample-app-terraform/                   # Sample TF files for app teams
+    ├── backend.tf                          # Artifactory backend config
+    ├── variables.tf                        # Pipeline-injected variables
+    ├── main.tf                             # Infrastructure using SRE modules
+    ├── outputs.tf                          # Pipeline-captured outputs
+    └── terraform.tfvars.example            # Example variable values
+```
 
 ---
 
@@ -90,8 +243,12 @@ All credentials flow through Jenkins Credential Store backed by CyberArk. The NS
 |------|---------|-------|
 | `Jenkinsfile.template` | Master pipeline template with 6 stages | SRE |
 | `sre_onboard_app.sh` | Onboarding automation script | SRE |
+| `jenkins-shared-library/vars/*.groovy` | Reusable pipeline steps | SRE |
+| `terraform-modules/modules/` | Versioned Terraform modules | SRE |
+| `terraform-agent/setup-agent.sh` | Agent provisioning script | SRE |
+| `sample-app-terraform/*.tf` | Sample Terraform scaffolding | SRE |
 | `Jenkinsfile` (generated) | Application-specific pipeline | SRE (generated) |
-| `*.tf` files | Terraform infrastructure definitions | Application Team |
+| `*.tf` files (in app repo) | Terraform infrastructure definitions | Application Team |
 | `tfplan-*.out` | Archived plan files per build | Pipeline (auto) |
 | `tf-outputs-*.json` | Terraform output captures | Pipeline (auto) |
 | `deployment-report-*.txt` | Post-deployment validation report | Pipeline (auto) |

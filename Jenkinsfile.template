@@ -5,6 +5,11 @@
 // ============================================================================
 // Infrastructure Provisioning - Jenkins CI/CD integration with Terraform IaC
 //
+// This pipeline uses the jenkins-devops-cicd-library shared library for
+// reusable steps: terraformInit, terraformValidate, terraformPlan,
+// terraformApply, terraformDestroy, approvalGate, postDeployValidation,
+// cyberarkCredentials, artifactoryModuleFetch.
+//
 // Pipeline Stages:
 //   1. Checkout Code
 //   2. Terraform Initialization and Validation
@@ -21,7 +26,7 @@ def cyberarkCAFile   = 'CA_Bundle.pem'               // Jenkins credentials stor
 
 pipeline {
     agent {
-        label 'terraform-agent'   // Agent any (terraform installed agents)
+        label 'terraform-agent'   // Agent provisioned via terraform-agent/setup-agent.sh
     }
 
     parameters {
@@ -83,20 +88,11 @@ pipeline {
                 // Pull Terraform code
                 echo "Terraform code pulled from repository"
 
-                // Fetch modules from Artifactory
-                withCredentials([
-                    usernamePassword(
-                        credentialsId: '{{ARTIFACTORY_CRED_ID}}',
-                        usernameVariable: 'USERNAME',
-                        passwordVariable: 'TF_TOKEN_artifactory_cib_echonet'
-                    )
-                ]) {
-                    sh '''
-                        echo "Fetching Terraform modules from Artifactory..."
-                        echo "Repository: infra-repo"
-                        echo "Branch: ${TARGET_BRANCH}"
-                    '''
-                }
+                // Fetch modules from Artifactory using shared library step
+                artifactoryModuleFetch(
+                    artifactoryCredId: '{{ARTIFACTORY_CRED_ID}}',
+                    targetBranch: params.TARGET_BRANCH
+                )
             }
         }
 
@@ -107,53 +103,23 @@ pipeline {
             steps {
                 echo "=== Stage 2: Terraform Initialization and Validation ==="
 
-                withCredentials([
-                    usernamePassword(
-                        credentialsId: '{{ARTIFACTORY_CRED_ID}}',
-                        usernameVariable: 'USERNAME',
-                        passwordVariable: 'TF_TOKEN_artifactory_cib_echonet'
-                    )
-                ]) {
-                    // --- terraform init ---
-                    // Backend config (Artifactory), Provider download, Module init from Artifactory
-                    sh '''
-                        echo ">>> terraform init"
-                        echo "  - Backend config: Artifactory"
-                        echo "  - Provider download: hashicorp/vsphere"
-                        echo "  - Module init from Artifactory"
-                        terraform init \
-                            -backend=true \
-                            -input=false
-                    '''
+                // terraform init - using shared library step
+                terraformInit(
+                    artifactoryCredId: '{{ARTIFACTORY_CRED_ID}}',
+                    backend: true
+                )
 
-                    // --- terraform validate ---
-                    // Syntax check, Config validation, Format check
-                    sh '''
-                        echo ">>> terraform validate"
-                        echo "  - Syntax check"
-                        echo "  - Config validation"
-                        echo "  - Format check"
-                        terraform validate
-                        terraform fmt -check -recursive
-                    '''
+                // terraform validate - using shared library step
+                terraformValidate(
+                    checkFormat: true
+                )
 
-                    // --- terraform plan ---
-                    // Generate plan file, Resource diff, Archive artifact
-                    sh """
-                        echo ">>> terraform plan"
-                        echo "  - Generate plan file"
-                        echo "  - Resource diff"
-                        terraform plan \
-                            -input=false \
-                            -out=${TF_PLAN_FILE} \
-                            -detailed-exitcode || PLAN_EXIT=\$?
-
-                        echo "Plan exit code: \${PLAN_EXIT:-0}"
-                    """
-
-                    // Archive the plan file as build artifact
-                    archiveArtifacts artifacts: "${TF_PLAN_FILE}", fingerprint: true
-                }
+                // terraform plan - using shared library step
+                terraformPlan(
+                    planFile: "${TF_PLAN_FILE}",
+                    artifactoryCredId: '{{ARTIFACTORY_CRED_ID}}',
+                    archive: true
+                )
             }
         }
 
@@ -167,43 +133,14 @@ pipeline {
             steps {
                 echo "=== Stage 3: Approval and Change Management ==="
 
-                script {
-                    // --- ServiceNow API Integration ---
-                    // Create CHG ticket, Validate approval, Attach plan file
-                    echo "ServiceNow Integration:"
-                    echo "  - Creating CHG ticket for ${params.ENVIRONMENT} deployment..."
-                    echo "  - Attaching plan file: ${TF_PLAN_FILE}"
-
-                    // Placeholder for ServiceNow API call
-                    // def chgTicket = serviceNowCreateChange(
-                    //     description: "Terraform deployment to ${params.ENVIRONMENT}",
-                    //     environment: params.ENVIRONMENT,
-                    //     planFile: TF_PLAN_FILE
-                    // )
-
-                    // --- Notifications ---
-                    // Email alerts, Teams message
-                    echo "Sending notifications..."
-                    echo "  - Email alerts to approvers"
-                    echo "  - Teams message to channel"
-
-                    // --- Manual Approval ---
-                    // Input message: Approve deployment to env?
-                    def userInput = input(
-                        id: 'approval',
-                        message: "Approve deployment to ${params.ENVIRONMENT}?",
-                        submitter: '{{APPROVER_GROUP}}',
-                        parameters: [
-                            string(
-                                name: 'APPROVAL_NOTES',
-                                defaultValue: '',
-                                description: 'Add any notes for this deployment'
-                            )
-                        ]
-                    )
-
-                    echo "Deployment approved. Notes: ${userInput}"
-                }
+                // Approval gate with ServiceNow integration - using shared library step
+                approvalGate(
+                    environment: params.ENVIRONMENT,
+                    planFile: TF_PLAN_FILE,
+                    approverGroup: '{{APPROVER_GROUP}}',
+                    notifyTeams: true,
+                    notifyEmail: true
+                )
             }
         }
 
@@ -217,44 +154,14 @@ pipeline {
             steps {
                 echo "=== Stage 4: Terraform Apply - Infrastructure Deployment ==="
 
-                withCredentials([
-                    usernamePassword(
-                        credentialsId: '{{ARTIFACTORY_CRED_ID}}',
-                        usernameVariable: 'USERNAME',
-                        passwordVariable: 'TF_TOKEN_artifactory_cib_echonet'
-                    ),
-                    string(
-                        credentialsId: '{{APIGEE_CRED_ID}}',
-                        variable: 'IV2_API_KEY'
-                    )
-                ]) {
-                    script {
-                        // terraform apply
-                        //   - Load plan file
-                        //   - Execute deployment
-                        //   - Capture outputs
-                        //   - Update state in Artifactory
-                        sh """
-                            echo ">>> terraform apply"
-                            echo "  - Loading plan file: ${TF_PLAN_FILE}"
-                            echo "  - Executing deployment to ${params.ENVIRONMENT}"
-                            export TF_LOG=TRACE
-
-                            terraform apply \
-                                -input=false \
-                                -auto-approve \
-                                ${TF_PLAN_FILE}
-
-                            echo ">>> Capturing outputs..."
-                            terraform output -json > tf-outputs-${params.ENVIRONMENT}.json
-
-                            echo "  - State updated in Artifactory"
-                            echo "  - Outputs captured"
-                        """
-
-                        archiveArtifacts artifacts: "tf-outputs-${params.ENVIRONMENT}.json", fingerprint: true
-                    }
-                }
+                // terraform apply - using shared library step
+                terraformApply(
+                    planFile: "${TF_PLAN_FILE}",
+                    environment: params.ENVIRONMENT,
+                    artifactoryCredId: '{{ARTIFACTORY_CRED_ID}}',
+                    apigeeCredId: '{{APIGEE_CRED_ID}}',
+                    captureOutputs: true
+                )
             }
         }
 
@@ -268,43 +175,13 @@ pipeline {
             steps {
                 echo "=== Stage 5: Terraform Destroy ==="
 
-                script {
-                    input(
-                        message: "CONFIRM: Destroy ALL infrastructure in ${params.ENVIRONMENT}?",
-                        ok: 'Yes, destroy it'
-                    )
-                }
-
-                withCredentials([
-                    usernamePassword(
-                        credentialsId: '{{ARTIFACTORY_CRED_ID}}',
-                        usernameVariable: 'USERNAME',
-                        passwordVariable: 'TF_TOKEN_artifactory_cib_echonet'
-                    ),
-                    string(
-                        credentialsId: '{{APIGEE_CRED_ID}}',
-                        variable: 'IV2_API_KEY'
-                    )
-                ]) {
-                    // terraform destroy
-                    //   - Load plan file and state file
-                    //   - Execute destruction
-                    //   - Capture outputs
-                    //   - Update state in Artifactory
-                    sh '''
-                        echo ">>> terraform destroy"
-                        echo "  - Loading state file from Artifactory"
-                        echo "  - Executing destruction"
-                        export TF_LOG=TRACE
-
-                        terraform destroy \
-                            -input=false \
-                            -auto-approve
-
-                        echo "  - Destruction complete"
-                        echo "  - State updated in Artifactory"
-                    '''
-                }
+                // terraform destroy - using shared library step
+                terraformDestroy(
+                    environment: params.ENVIRONMENT,
+                    artifactoryCredId: '{{ARTIFACTORY_CRED_ID}}',
+                    apigeeCredId: '{{APIGEE_CRED_ID}}',
+                    confirm: true
+                )
             }
         }
 
@@ -318,52 +195,14 @@ pipeline {
             steps {
                 echo "=== Stage 6: Post-Deployment Validation ==="
 
-                script {
-                    // --- Smoke Tests ---
-                    echo "Running Smoke Tests..."
-                    sh '''
-                        echo "  - Verifying infrastructure endpoints..."
-                        echo "  - Checking connectivity to provisioned resources..."
-                        # Add custom smoke test commands here
-                        # Example: curl -sf https://<app-url>/health || exit 1
-                    '''
-
-                    // --- Health Checks ---
-                    echo "Running Health Checks..."
-                    sh '''
-                        echo "  - Checking Load Balancer (HAProxy) health..."
-                        echo "  - Checking Reverse Proxy (Apache HTTPD 2.4) status..."
-                        echo "  - Checking App Servers (Java/Dataframe) availability..."
-                        echo "  - Checking NFS mount points (/mnt/data, /mnt/binaries)..."
-                        # Add health check commands
-                    '''
-
-                    // --- Ansible Config ---
-                    echo "Running Ansible post-deployment configuration..."
-                    sh '''
-                        echo "  - Executing Ansible playbooks for post-deploy config..."
-                        # Example: ansible-playbook -i inventory post-deploy.yml
-                    '''
-
-                    // --- Generate Report ---
-                    echo "Generating deployment report..."
-                    sh """
-                        echo "========================================" > deployment-report-${params.ENVIRONMENT}.txt
-                        echo " Deployment Report"                      >> deployment-report-${params.ENVIRONMENT}.txt
-                        echo "========================================" >> deployment-report-${params.ENVIRONMENT}.txt
-                        echo " Environment: ${params.ENVIRONMENT}"     >> deployment-report-${params.ENVIRONMENT}.txt
-                        echo " Ecosystem:   ${params.ECOSYSTEM}"       >> deployment-report-${params.ENVIRONMENT}.txt
-                        echo " Build:       ${BUILD_NUMBER}"           >> deployment-report-${params.ENVIRONMENT}.txt
-                        echo " Branch:      ${params.TARGET_BRANCH}"   >> deployment-report-${params.ENVIRONMENT}.txt
-                        echo " Action:      ${params.ACTION}"          >> deployment-report-${params.ENVIRONMENT}.txt
-                        echo " Timestamp:   \$(date -u)"               >> deployment-report-${params.ENVIRONMENT}.txt
-                        echo "========================================" >> deployment-report-${params.ENVIRONMENT}.txt
-                        terraform output -json                         >> deployment-report-${params.ENVIRONMENT}.txt 2>/dev/null || true
-                        echo "========================================" >> deployment-report-${params.ENVIRONMENT}.txt
-                    """
-
-                    archiveArtifacts artifacts: "deployment-report-${params.ENVIRONMENT}.txt", fingerprint: true
-                }
+                // Post-deploy validation - using shared library step
+                postDeployValidation(
+                    environment: params.ENVIRONMENT,
+                    ecosystem: params.ECOSYSTEM,
+                    targetBranch: params.TARGET_BRANCH,
+                    action: params.ACTION,
+                    runAnsible: true
+                )
             }
         }
     }

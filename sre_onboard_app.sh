@@ -8,7 +8,8 @@
 # What it does:
 #   1. Creates statefile directories in Artifactory for the application
 #   2. Generates a Jenkinsfile from the SRE template
-#   3. (Optional) Pushes the Jenkinsfile to the application repository
+#   3. Copies sample Terraform files for the application team
+#   4. (Optional) Pushes the Jenkinsfile to the application repository
 #
 # Usage:
 #   ./sre_onboard_app.sh \
@@ -30,7 +31,9 @@ CYBERARK_CERT_ID="AIM-PBGBLPRIMEDB-OPSD-Cyberark.cert"
 CYBERARK_KEY_ID="AIM-PBGBLPRIMEDB-OPSD-Cyberark.key"
 ARTIFACTORY_CRED_ID="primedb_cib_artifactory"
 APIGEE_CRED_ID="APIGEE_PDB_DEV"
-TEMPLATE_FILE="$(dirname "$0")/Jenkinsfile.template"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+TEMPLATE_FILE="${SCRIPT_DIR}/Jenkinsfile.template"
+SAMPLE_TF_DIR="${SCRIPT_DIR}/sample-app-terraform"
 OUTPUT_DIR="./generated"
 
 # ---- Color Output ----
@@ -49,18 +52,20 @@ log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 APP_NAME=""
 REPO_URL=""
 PUSH_TO_REPO=false
+INCLUDE_SAMPLE_TF=true
 
 usage() {
     echo "Usage: $0 --app-name <name> [--environments 'DEV,STG,PT,QA'] [--ecosystems 'PB-GLOBALPRIMEDB,Puma'] [--repo-url <url>] [--push]"
     echo ""
     echo "Options:"
-    echo "  --app-name        (Required) Application name for statefile directories"
-    echo "  --environments    Comma-separated environments (default: DEV,STG)"
-    echo "  --ecosystems      Comma-separated ecosystems (default: PB-GLOBALPRIMEDB,Puma)"
-    echo "  --artifactory-url Artifactory base URL"
-    echo "  --repo-url        Bitbucket repository URL for the application"
-    echo "  --push            Push generated Jenkinsfile to application repo"
-    echo "  --help            Show this help message"
+    echo "  --app-name         (Required) Application name for statefile directories"
+    echo "  --environments     Comma-separated environments (default: DEV,STG)"
+    echo "  --ecosystems       Comma-separated ecosystems (default: PB-GLOBALPRIMEDB,Puma)"
+    echo "  --artifactory-url  Artifactory base URL"
+    echo "  --repo-url         Bitbucket repository URL for the application"
+    echo "  --push             Push generated Jenkinsfile to application repo"
+    echo "  --no-sample-tf     Skip copying sample Terraform files"
+    echo "  --help             Show this help message"
     exit 1
 }
 
@@ -72,6 +77,7 @@ while [[ $# -gt 0 ]]; do
         --artifactory-url) ARTIFACTORY_BASE_URL="$2"; shift 2 ;;
         --repo-url)        REPO_URL="$2"; shift 2 ;;
         --push)            PUSH_TO_REPO=true; shift ;;
+        --no-sample-tf)    INCLUDE_SAMPLE_TF=false; shift ;;
         --help)            usage ;;
         *)                 log_error "Unknown option: $1"; usage ;;
     esac
@@ -158,19 +164,52 @@ log_ok "Generated: ${OUTPUT_DIR}/Jenkinsfile"
 echo ""
 
 # ============================================================================
-# STEP 3: (Optional) Push to Application Repository
+# STEP 3: Copy Sample Terraform Files
+# ============================================================================
+if [[ "$INCLUDE_SAMPLE_TF" == true ]]; then
+    log_info "Step 3: Copying sample Terraform files..."
+
+    mkdir -p "${OUTPUT_DIR}/terraform"
+
+    if [[ -d "$SAMPLE_TF_DIR" ]]; then
+        for tf_file in "${SAMPLE_TF_DIR}"/*.tf "${SAMPLE_TF_DIR}"/*.example; do
+            if [[ -f "$tf_file" ]]; then
+                filename=$(basename "$tf_file")
+                # Replace <app-name> placeholder with actual app name
+                sed "s|<app-name>|${APP_NAME}|g" "$tf_file" > "${OUTPUT_DIR}/terraform/${filename}"
+                log_ok "  Copied: ${filename}"
+            fi
+        done
+    else
+        log_warn "  Sample Terraform directory not found: ${SAMPLE_TF_DIR}"
+    fi
+
+    echo ""
+else
+    log_info "Step 3: Skipped (sample Terraform files not included)"
+    echo ""
+fi
+
+# ============================================================================
+# STEP 4: (Optional) Push to Application Repository
 # ============================================================================
 if [[ "$PUSH_TO_REPO" == true && -n "$REPO_URL" ]]; then
-    log_info "Step 3: Pushing Jenkinsfile to application repository..."
+    log_info "Step 4: Pushing Jenkinsfile to application repository..."
 
     TEMP_CLONE=$(mktemp -d)
     git clone "$REPO_URL" "$TEMP_CLONE" 2>/dev/null
 
     cp "${OUTPUT_DIR}/Jenkinsfile" "${TEMP_CLONE}/Jenkinsfile"
 
+    # Copy sample Terraform files if they were generated
+    if [[ "$INCLUDE_SAMPLE_TF" == true && -d "${OUTPUT_DIR}/terraform" ]]; then
+        cp "${OUTPUT_DIR}"/terraform/*.tf "${TEMP_CLONE}/" 2>/dev/null || true
+        cp "${OUTPUT_DIR}"/terraform/*.example "${TEMP_CLONE}/" 2>/dev/null || true
+    fi
+
     cd "$TEMP_CLONE"
-    git add Jenkinsfile
-    git commit -m "chore(sre): add SRE managed Jenkinsfile for Terraform pipeline
+    git add Jenkinsfile *.tf *.example 2>/dev/null || git add Jenkinsfile
+    git commit -m "chore(sre): add SRE managed Jenkinsfile and Terraform scaffolding
 
 Onboarded by SRE Ecosystem automation.
 Application: ${APP_NAME}
@@ -181,9 +220,9 @@ Ecosystems: ${ECOSYSTEMS}"
     cd -
     rm -rf "$TEMP_CLONE"
 
-    log_ok "Jenkinsfile pushed to repository."
+    log_ok "Jenkinsfile and Terraform files pushed to repository."
 else
-    log_info "Step 3: Skipped (use --push --repo-url <url> to push to repo)"
+    log_info "Step 4: Skipped (use --push --repo-url <url> to push to repo)"
 fi
 
 echo ""
@@ -191,10 +230,21 @@ echo "============================================================"
 echo " Onboarding Complete!"
 echo "============================================================"
 echo ""
+echo " Generated Files:"
+echo "   - ${OUTPUT_DIR}/Jenkinsfile"
+if [[ "$INCLUDE_SAMPLE_TF" == true ]]; then
+echo "   - ${OUTPUT_DIR}/terraform/backend.tf"
+echo "   - ${OUTPUT_DIR}/terraform/variables.tf"
+echo "   - ${OUTPUT_DIR}/terraform/main.tf"
+echo "   - ${OUTPUT_DIR}/terraform/outputs.tf"
+echo "   - ${OUTPUT_DIR}/terraform/terraform.tfvars.example"
+fi
+echo ""
 echo " Next Steps for Application Team:"
 echo "   1. Review the generated Jenkinsfile in: ${OUTPUT_DIR}/Jenkinsfile"
-echo "   2. Add/modify your Terraform files (main.tf, variables.tf, outputs.tf)"
-echo "   3. Ensure your backend config points to the SRE statefile location"
-echo "   4. Run the Jenkins pipeline with the appropriate environment"
+echo "   2. Customize the Terraform files in: ${OUTPUT_DIR}/terraform/"
+echo "   3. Update terraform.tfvars.example with your environment values"
+echo "   4. Ensure your backend config points to the SRE statefile location"
+echo "   5. Run the Jenkins pipeline with the appropriate environment"
 echo ""
 echo "============================================================"
