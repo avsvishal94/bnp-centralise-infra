@@ -1,224 +1,161 @@
-@Library("jenkins-devops-cicd-library") _
+@Library("jenkins-devops-cicd-library")
 
-// ============================================================================
-// SRE Ecosystem - Terraform Infrastructure Provisioning Pipeline
-// ============================================================================
-// Infrastructure Provisioning - Jenkins CI/CD integration with Terraform IaC
-//
-// This pipeline uses the jenkins-devops-cicd-library shared library for
-// reusable steps: terraformInit, terraformValidate, terraformPlan,
-// terraformApply, terraformDestroy, approvalGate, postDeployValidation,
-// cyberarkCredentials, artifactoryModuleFetch.
-//
-// Pipeline Stages:
-//   1. Checkout Code
-//   2. Terraform Initialization and Validation
-//   3. Approval and Change Management
-//   4. Terraform Apply - Infrastructure Deployment
-//   5. Terraform Destroy (Conditional)
-//   6. Post-Deployment Validation
-// ============================================================================
-
-// ---- CyberArk Credentials (SRE Managed) ----
-def cyberarkCertFile = '{{CYBERARK_CERT_ID}}'       // Jenkins credentials store ID with CyberArk Certificate file
-def cyberarkKeyFile  = '{{CYBERARK_KEY_ID}}'         // Jenkins credentials store ID with CyberArk Key file
-def cyberarkCAFile   = 'CA_Bundle.pem'               // Jenkins credentials store ID with CyberArk CA_Bundle file
+def cyberarkCertFile = 'AIM-PBGBLPRIMEDB-OPSD-Cyberark.cert'
+def cyberarkKeyFile  = 'AIM-PBGBLPRIMEDB-OPSD-Cyberark.key'
+def cyberarkCAFile   = 'CA_Bundle.pem'
 
 pipeline {
+
     agent {
-        label 'terraform-agent'   // Agent provisioned via terraform-agent/setup-agent.sh
-    }
-
-    parameters {
-        choice(
-            name: 'ENVIRONMENT',
-            choices: [{{ENVIRONMENT_CHOICES}}],
-            description: 'Select environment on which the script needs to be run'
-        )
-        choice(
-            name: 'ECOSYSTEM',
-            choices: [{{ECOSYSTEM_CHOICES}}],
-            description: 'Select ecosystem on which the script needs to be run'
-        )
-        choice(
-            name: 'ACTION',
-            choices: ['apply', 'destroy'],
-            description: 'Select Terraform action: apply to deploy, destroy to tear down'
-        )
-        booleanParam(
-            name: 'AUTO_APPROVE',
-            defaultValue: false,
-            description: 'Skip manual approval gate? (Use with caution)'
-        )
-        string(
-            name: 'TARGET_BRANCH',
-            defaultValue: 'main',
-            description: 'Branch to checkout (main, develop, feature/*)'
-        )
-    }
-
-    environment {
-        TF_VAR_env       = "${params.ENVIRONMENT}"
-        TF_VAR_ecosystem = "${params.ECOSYSTEM}"
-        TF_IN_AUTOMATION = 'true'
-        TF_PLAN_FILE     = "tfplan-${params.ENVIRONMENT}-${BUILD_NUMBER}.out"
-        ARTIFACTORY_URL  = '{{ARTIFACTORY_URL}}'
+        label 'bnpp-cdtools-amer'
     }
 
     options {
-        buildDiscarder(logRotator(numToKeepStr: '20'))
-        timestamps()
-        timeout(time: 60, unit: 'MINUTES')
         disableConcurrentBuilds()
+        timestamps()
     }
 
-    // ========================================================================
-    // STAGE 1: Checkout Code
-    // ========================================================================
-    stages {
-        stage('Stage 1: Checkout Code') {
-            steps {
-                echo "=== Stage 1: Checkout Code ==="
-                echo "Branch: ${params.TARGET_BRANCH}"
+    parameters {
 
-                // Git checkout from main/develop/feature
+        choice(name: 'ENVIRONMENT',
+               choices: ['DEV', 'STG'],
+               description: 'Select environment')
+
+        booleanParam(name: 'destroy',
+                     defaultValue: false,
+                     description: 'Destroy Terraform build?')
+
+        choice(name: 'ECOSYSTEM',
+               choices: ['PB-GLOBALPRIMEDB', 'Puma'],
+               description: 'Select ecosystem')
+
+        string(name: 'APPLICATION_NAME',
+               defaultValue: 'abc',
+               description: 'Application name')
+    }
+
+    environment {
+        TF_IN_AUTOMATION = "true"
+        TF_INPUT         = "false"
+        TF_LOCK_TIMEOUT  = "300s"
+    }
+
+    stages {
+
+        stage('Clone Repo') {
+            steps {
                 checkout scm
                 sh 'printenv'
-
-                // Pull Terraform code
-                echo "Terraform code pulled from repository"
-
-                // Fetch modules from Artifactory using shared library step
-                artifactoryModuleFetch(
-                    artifactoryCredId: '{{ARTIFACTORY_CRED_ID}}',
-                    targetBranch: params.TARGET_BRANCH
-                )
             }
         }
 
-        // ====================================================================
-        // STAGE 2: Terraform Initialization and Validation
-        // ====================================================================
-        stage('Stage 2: Terraform Initialization and Validation') {
+        stage('Terraform init') {
             steps {
-                echo "=== Stage 2: Terraform Initialization and Validation ==="
 
-                // terraform init - using shared library step
-                terraformInit(
-                    artifactoryCredId: '{{ARTIFACTORY_CRED_ID}}',
-                    backend: true
-                )
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'primedb_cib_artifactory',
+                        usernameVariable: 'USERNAME',
+                        passwordVariable: 'TF_TOKEN_artifactory_cib_echonet'
+                    ),
+                    file(credentialsId: cyberarkCertFile, variable: 'CYBERARK_CERT'),
+                    file(credentialsId: cyberarkKeyFile,  variable: 'CYBERARK_KEY'),
+                    file(credentialsId: cyberarkCAFile,   variable: 'CYBERARK_CA')
+                ]) {
 
-                // terraform validate - using shared library step
-                terraformValidate(
-                    checkFormat: true
-                )
-
-                // terraform plan - using shared library step
-                terraformPlan(
-                    planFile: "${TF_PLAN_FILE}",
-                    artifactoryCredId: '{{ARTIFACTORY_CRED_ID}}',
-                    archive: true
-                )
+                    sh """
+                        terraform -chdir=Environments/${params.ENVIRONMENT} init -reconfigure \
+                          -backend-config="repo=terraform-state" \
+                          -backend-config="subpath=${params.ECOSYSTEM}/${params.APPLICATION_NAME}/${params.ENVIRONMENT}/terraform.tfstate"
+                    """
+                }
             }
         }
 
-        // ====================================================================
-        // STAGE 3: Approval and Change Management
-        // ====================================================================
-        stage('Stage 3: Approval and Change Management') {
+        stage('Terraform plan') {
             when {
-                expression { return params.ACTION == 'apply' && !params.AUTO_APPROVE }
+                expression { return !params.destroy }
             }
             steps {
-                echo "=== Stage 3: Approval and Change Management ==="
 
-                // Approval gate with ServiceNow integration - using shared library step
-                approvalGate(
-                    environment: params.ENVIRONMENT,
-                    planFile: TF_PLAN_FILE,
-                    approverGroup: '{{APPROVER_GROUP}}',
-                    notifyTeams: true,
-                    notifyEmail: true
-                )
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'primedb_cib_artifactory',
+                        usernameVariable: 'USERNAME',
+                        passwordVariable: 'TF_TOKEN_artifactory_cib_echonet'
+                    ),
+                    string(
+                        credentialsId: 'APIGEE_PDB_DEV',
+                        variable: 'IV2_API_KEY'
+                    )
+                ]) {
+
+                    script {
+                        env.TF_VAR_env = params.ENVIRONMENT
+                        env.TF_VAR_ecosystem = params.ECOSYSTEM
+                    }
+
+                    sh """
+                        terraform -chdir=Environments/${params.ENVIRONMENT} plan -out=tfplan
+                        terraform -chdir=Environments/${params.ENVIRONMENT} show tfplan
+                    """
+                }
             }
         }
 
-        // ====================================================================
-        // STAGE 4: Terraform Apply - Infrastructure Deployment
-        // ====================================================================
-        stage('Stage 4: Terraform Apply - Infrastructure Deployment') {
+        stage('Terraform apply') {
             when {
-                expression { return params.ACTION == 'apply' }
+                expression { return !params.destroy }
             }
             steps {
-                echo "=== Stage 4: Terraform Apply - Infrastructure Deployment ==="
 
-                // terraform apply - using shared library step
-                terraformApply(
-                    planFile: "${TF_PLAN_FILE}",
-                    environment: params.ENVIRONMENT,
-                    artifactoryCredId: '{{ARTIFACTORY_CRED_ID}}',
-                    apigeeCredId: '{{APIGEE_CRED_ID}}',
-                    captureOutputs: true
-                )
+                input message: "Approve Terraform Apply?"
+
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'primedb_cib_artifactory',
+                        usernameVariable: 'USERNAME',
+                        passwordVariable: 'TF_TOKEN_artifactory_cib_echonet'
+                    ),
+                    string(
+                        credentialsId: 'APIGEE_PDB_DEV',
+                        variable: 'IV2_API_KEY'
+                    )
+                ]) {
+
+                    sh """
+                        terraform -chdir=Environments/${params.ENVIRONMENT} apply -auto-approve tfplan
+                        terraform -chdir=Environments/${params.ENVIRONMENT} output -json
+                    """
+                }
             }
         }
 
-        // ====================================================================
-        // STAGE 5: Terraform Destroy (Conditional)
-        // ====================================================================
-        stage('Stage 5: Terraform Destroy') {
+        stage('Terraform destroy') {
             when {
-                expression { return params.ACTION == 'destroy' }
+                equals expected: true, actual: params.destroy
             }
             steps {
-                echo "=== Stage 5: Terraform Destroy ==="
 
-                // terraform destroy - using shared library step
-                terraformDestroy(
-                    environment: params.ENVIRONMENT,
-                    artifactoryCredId: '{{ARTIFACTORY_CRED_ID}}',
-                    apigeeCredId: '{{APIGEE_CRED_ID}}',
-                    confirm: true
-                )
+                input message: "Confirm Terraform Destroy?"
+
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'primedb_cib_artifactory',
+                        usernameVariable: 'USERNAME',
+                        passwordVariable: 'TF_TOKEN_artifactory_cib_echonet'
+                    ),
+                    string(
+                        credentialsId: 'APIGEE_PDB_DEV',
+                        variable: 'IV2_API_KEY'
+                    )
+                ]) {
+
+                    sh """
+                        terraform -chdir=Environments/${params.ENVIRONMENT} destroy -auto-approve
+                    """
+                }
             }
-        }
-
-        // ====================================================================
-        // STAGE 6: Post-Deployment Validation
-        // ====================================================================
-        stage('Stage 6: Post-Deployment Validation') {
-            when {
-                expression { return params.ACTION == 'apply' }
-            }
-            steps {
-                echo "=== Stage 6: Post-Deployment Validation ==="
-
-                // Post-deploy validation - using shared library step
-                postDeployValidation(
-                    environment: params.ENVIRONMENT,
-                    ecosystem: params.ECOSYSTEM,
-                    targetBranch: params.TARGET_BRANCH,
-                    action: params.ACTION,
-                    runAnsible: true
-                )
-            }
-        }
-    }
-
-    // ========================================================================
-    // POST-PIPELINE ACTIONS
-    // ========================================================================
-    post {
-        success {
-            echo "Pipeline completed successfully for ${params.ENVIRONMENT} - ${params.ACTION}"
-        }
-        failure {
-            echo "Pipeline FAILED for ${params.ENVIRONMENT} - ${params.ACTION}"
-        }
-        always {
-            cleanWs()
         }
     }
 }
